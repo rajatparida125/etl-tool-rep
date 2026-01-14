@@ -1,104 +1,256 @@
 import streamlit as st
 import pandas as pd
+import json
 import io
+import os
 
-st.set_page_config(page_title="Simple ETL Tool", layout="wide")
+st.set_page_config(page_title="Advanced ETL v2.2", layout="wide")
 
-st.title("🔄 Simple ETL Tool")
-st.markdown("Upload raw data + mapping → configure → download transformed CSV")
+st.title("🚀 Advanced ETL Tool")
+st.markdown("**Direct Copy + Lookup + Conditional Logic**")
 
-# Step 1: File uploads
-col1, col2 = st.columns(2)
-with col1:
-    raw_file = st.file_uploader("📁 Upload raw CSV/Excel", type=['csv', 'xlsx', 'xls'], key="raw")
-with col2:
-    mapping_file = st.file_uploader("🗺️ Upload mapping file (optional)", type=['csv', 'xlsx', 'xls'], key="mapping")
-
-if raw_file is not None:
-    # Read raw data
-    if raw_file.name.endswith('.csv'):
-        df = pd.read_csv(raw_file)
-    else:
-        df = pd.read_excel(raw_file)
+EXAMPLES = {
+    "1. Direct Copy": '''{
+  "output_columns": [
+    {"name": "OrderID", "source": "order_id"},
+    {"name": "Amount", "source": "amount"},
+    {"name": "Priority", "source": "priority"}
+  ]
+}''',
     
-    st.success(f"✅ Loaded {len(df)} rows, {len(df.columns)} columns")
-    st.dataframe(df.head(10), use_container_width=True)
+    "2. Lookup Example": '''{
+  "output_columns": [
+    {"name": "OrderID", "source": "order_id"},
+    {
+      "name": "ProductName",
+      "lookup": {
+        "mapping_file": "product_mapping",
+        "input_col": "product_code",
+        "key_col": "product_code",
+        "target_col": "product_name"
+      }
+    },
+    {"name": "Amount", "source": "amount"}
+  ]
+}''',
+    
+    "3. ALL 3 Types": '''{
+  "output_columns": [
+    {"name": "OrderID", "source": "order_id"},
+    {
+      "name": "ProductName",
+      "lookup": {
+        "mapping_file": "product_mapping",
+        "input_col": "product_code",
+        "key_col": "product_code", 
+        "target_col": "product_name"
+      }
+    },
+    {
+      "name": "CustomerTier",
+      "condition": {
+        "if": [
+          {"input_col": "amount", "operator": ">", "value": 200}
+        ],
+        "then": "Premium",
+        "else": "Standard"
+      }
+    }
+  ]
+}'''
+}
 
-    # Show mapping preview if uploaded
-    mapping_df = None
-    if mapping_file is not None:
-        if mapping_file.name.endswith('.csv'):
-            mapping_df = pd.read_csv(mapping_file)
+# Sidebar - ROBUST file handling
+with st.sidebar:
+    st.header("📁 Upload Files")
+    
+    # Input file with validation
+    raw_file = st.file_uploader("**Input File**", type=['csv', 'xlsx'], key="raw")
+    
+    if raw_file:
+        # Check file size & content FIRST
+        file_size = len(raw_file.getvalue())
+        st.info(f"📊 File size: {file_size/1000:.1f} KB")
+        
+        if file_size == 0:
+            st.error("❌ File is empty!")
         else:
-            mapping_df = pd.read_excel(mapping_file)
-        st.success(f"✅ Mapping loaded: {len(mapping_df)} rows")
-        st.dataframe(mapping_df.head(), use_container_width=True)
-
-    # Step 2: Configure transforms
-    st.subheader("⚙️ Configure Output Columns")
-    st.markdown("**For each output column:**")
+            st.success("✅ File loaded OK")
     
-    output_columns = []
-    num_output_cols = st.number_input("Number of output columns", min_value=1, max_value=10, value=3, key="num_cols")
+    # Mapping files
+    mapping_files = {}
+    num_mappings = st.number_input("Mapping files", 0, 5, 1, key="num_maps")
     
-    for i in range(num_output_cols):
-        with st.expander(f"Output Column {i+1}"):
-            col_name = st.text_input(f"Output column name", value=f"col_{i+1}", key=f"name_{i}")
+    for i in range(num_mappings):
+        with st.expander(f"Mapping {i+1}"):
+            uploaded_file = st.file_uploader(f"File {i+1}", type=['csv', 'xlsx'], key=f"file_{i}")
+            name = st.text_input("Name (e.g: product_mapping)", value=f"mapping_{i+1}", key=f"name_{i}")
             
-            # Source column selection
-            source_col = st.selectbox(f"Source column", options=['None'] + list(df.columns.tolist()), key=f"source_{i}")
-            
-            # Mapping (if mapping file exists)
-            mapping_choice = "None"
-            if mapping_df is not None:
-                mapping_choice = st.selectbox("Apply mapping?", 
-                                            options=["None"] + list(mapping_df.columns),
-                                            key=f"mapping_{i}")
-            
-            output_columns.append({
-                'name': col_name,
-                'source': source_col,
-                'mapping_key': mapping_choice if mapping_choice != "None" else None
-            })
-    
-    # Step 3: Transform button
-    if st.button("🚀 Run Transform", type="primary", key="transform"):
-        result_df = pd.DataFrame()
-        
-        for config in output_columns:
-            if config['source'] != 'None':
-                # Copy source column
-                result_df[config['name']] = df[config['source']]
-                
-                # Apply mapping if specified
-                if config['mapping_key'] and mapping_df is not None:
-                    # Better mapping logic - find next column after key as target
-                    key_col_idx = list(mapping_df.columns).index(config['mapping_key'])
-                    if key_col_idx + 1 < len(mapping_df.columns):
-                        target_col = mapping_df.columns[key_col_idx + 1]
-                        map_dict = mapping_df.set_index(config['mapping_key'])[target_col].to_dict()
-                        result_df[config['name']] = result_df[config['name']].map(map_dict).fillna(result_df[config['name']])
-                        st.info(f"✅ Mapped {config['name']} using {config['mapping_key']} → {target_col}")
+            if uploaded_file and name:
+                try:
+                    # Read with error handling
+                    if uploaded_file.name.endswith('.csv'):
+                        temp_df = pd.read_csv(uploaded_file, nrows=5)
                     else:
-                        st.warning(f"No target column found after {config['mapping_key']}")
+                        temp_df = pd.read_excel(uploaded_file, nrows=5)
+                    
+                    mapping_files[name] = temp_df
+                    st.success(f"✅ **{name}**: {len(temp_df)} rows, {len(temp_df.columns)} cols")
+                    
+                except pd.errors.EmptyDataError:
+                    st.error(f"❌ **{name}**: Empty or bad format")
+                except Exception as e:
+                    st.error(f"❌ **{name}**: {str(e)}")
+
+# Main page
+col1, col2 = st.columns(2)
+
+with col1:
+    st.header("📝 JSON Logic")
+    
+    # Show input columns if file valid
+    input_columns = []
+    if raw_file and len(raw_file.getvalue()) > 0:
+        try:
+            raw_buffer = raw_file.read()
+            raw_file.seek(0)  # Reset file pointer
+            if raw_file.name.endswith('.csv'):
+                df_preview = pd.read_csv(io.StringIO(raw_buffer.decode('utf-8')))
+            else:
+                df_preview = pd.read_excel(raw_file)
+            
+            input_columns = df_preview.columns.tolist()
+            st.info(f"**Input columns**: {', '.join(input_columns)}")
+        except:
+            st.warning("⚠️ Cannot preview input columns")
+    
+    example_name = st.selectbox("📋 Load example", ["Custom"] + list(EXAMPLES.keys()), key="example")
+    
+    # Safe default JSON
+    safe_json = '''{
+  "output_columns": [
+    {"name": "Output1", "source": "order_id"}
+  ]
+}'''
+    
+    json_text = EXAMPLES.get(example_name.replace(" ", "_").lower(), safe_json)
+    json_text = st.text_area("**JSON Config**", json_text, height=400, key="json_main")
+
+with col2:
+    st.header("📖 Examples")
+    for title, ex in EXAMPLES.items():
+        with st.expander(title):
+            st.code(ex, language="json")
+
+# BULLETPROOF ETL EXECUTION
+if st.button("🚀 **RUN ETL**", type="primary") and raw_file:
+    try:
+        # SAFEST file reading
+        raw_buffer = raw_file.read()
+        raw_file.seek(0)
         
-        # Show result
-        st.success(f"✅ Transform complete! {len(result_df)} rows, {len(result_df.columns)} columns")
-        st.dataframe(result_df.head(10), use_container_width=True)
+        if len(raw_buffer) == 0:
+            st.error("❌ Input file is empty!")
+            st.stop()
+        
+        if raw_file.name.endswith('.csv'):
+            df = pd.read_csv(io.StringIO(raw_buffer.decode('utf-8')))
+        else:
+            df = pd.read_excel(raw_file)
+        
+        if df.empty:
+            st.error("❌ No data found in input file!")
+            st.stop()
+        
+        st.success(f"✅ Loaded **{len(df)} rows**, **{len(df.columns)} columns**")
+        st.dataframe(df.head(), height=200)
+        
+        config = json.loads(json_text)
+        result_df = pd.DataFrame()
+        errors = []
+        
+        # Process each output column SAFELY
+        for col_config in config.get("output_columns", []):
+            col_name = col_config.get("name", f"col_{len(result_df.columns)}")
+            
+            try:
+                # 1. DIRECT COPY
+                if "source" in col_config:
+                    source_col = col_config["source"]
+                    if source_col in df.columns:
+                        result_df[col_name] = df[source_col]
+                        st.success(f"📋 **{col_name}** ← `{source_col}`")
+                    else:
+                        result_df[col_name] = f"Missing: {source_col}"
+                        errors.append(f"❌ {col_name}: Column '{source_col}' not found")
+                
+                # 2. LOOKUP
+                elif "lookup" in col_config:
+                    lookup = col_config["lookup"]
+                    mapping_name = lookup["mapping_file"]
+                    
+                    if mapping_name in mapping_files:
+                        mapping_df = mapping_files[mapping_name]
+                        input_col = lookup["input_col"]
+                        key_col = lookup["key_col"]
+                        target_col = lookup["target_col"]
+                        
+                        if (input_col in df.columns and 
+                            key_col in mapping_df.columns and 
+                            target_col in mapping_df.columns):
+                            lookup_dict = mapping_df.set_index(key_col)[target_col].to_dict()
+                            result_df[col_name] = df[input_col].map(lookup_dict).fillna(df[input_col])
+                            st.success(f"🔍 **{col_name}** ← {mapping_name} ({key_col}→{target_col})")
+                        else:
+                            result_df[col_name] = "LOOKUP_ERROR"
+                            errors.append(f"❌ {col_name}: Invalid lookup columns")
+                    else:
+                        result_df[col_name] = f"No: {mapping_name}"
+                        errors.append(f"❌ {col_name}: Mapping '{mapping_name}' missing")
+                
+                # 3. CONDITIONAL
+                elif "condition" in col_config:
+                    cond = col_config["condition"]
+                    mask = pd.Series([True] * len(df), index=df.index)
+                    
+                    for if_cond in cond.get("if", []):
+                        input_col = if_cond["input_col"]
+                        if input_col in df.columns:
+                            col_val = df[input_col]
+                            op = if_cond["operator"]
+                            val = if_cond["value"]
+                            
+                            if op == "=": mask &= (col_val == val)
+                            elif op == ">": mask &= (col_val > val)
+                            elif op == "<": mask &= (col_val < val)
+                            elif op == ">=": mask &= (col_val >= val)
+                            elif op == "<=": mask &= (col_val <= val)
+                    
+                    result_df[col_name] = mask.map({True: cond["then"], False: cond["else"]})
+                    st.success(f"🧠 **{col_name}**: Conditional applied")
+            
+            except Exception as col_error:
+                result_df[col_name] = f"Error"
+                errors.append(f"❌ {col_name}: {str(col_error)}")
+        
+        # FINAL RESULTS
+        st.header("✅ **Transformation Results**")
+        st.dataframe(result_df, use_container_width=True)
+        
+        if errors:
+            st.error("**Issues:**\n" + "\n".join(errors[:3]))
         
         # Download
         csv_buffer = io.StringIO()
         result_df.to_csv(csv_buffer, index=False)
-        st.download_button(
-            "📥 Download CSV",
-            csv_buffer.getvalue(),
-            "transformed_data.csv",
-            "text/csv",
-            key="download"
-        )
+        st.download_button("💾 **Download CSV**", csv_buffer.getvalue(), "etl_result.csv", type="primary")
         
-        # Log
-        st.subheader("📋 Transform Log")
-        st.text(f"Created {len(output_columns)} output columns")
-        if mapping_file:
-            st.text("Applied mapping from uploaded file")
+    except pd.errors.EmptyDataError:
+        st.error("❌ **File empty** - No data/columns found!")
+    except UnicodeDecodeError:
+        st.error("❌ **File encoding** - Try saving as UTF-8 CSV")
+    except Exception as e:
+        st.error(f"❌ **Error**: {str(e)}")
+
+st.markdown("---")
+st.caption("**Logic Types**: `source` (copy), `lookup` (mapping), `condition` (if/then)")
