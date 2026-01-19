@@ -18,7 +18,7 @@ st.set_page_config(page_title="KinetiBridge Universal ETL", layout="wide", page_
 # For Cloud Deployment, we hardcode the production URL to prevent detection errors.
 # If you want to run locally later, just swap the comment # to the other line.
 
-# redirect_uri = "http://localhost:8501/oauth2callback" # <--- UNCOMMENT FOR LOCAL TESTING
+# redirect_uri = "http://localhost:8501/oauth2callback"  # <--- UNCOMMENT FOR LOCAL TESTING
 redirect_uri = "https://etl-tool-rep-4p2dkdcahg8ltcnnrukfge.streamlit.app/oauth2callback" # <--- ACTIVE FOR CLOUD
 
 authenticator = Authenticate(
@@ -93,7 +93,7 @@ def sftp_action(host, port, user, password, action, remote_path, local_data=None
 def apply_rules_engine(main_df, rules, mapping_dfs):
     """
     Applies transformation logic.
-    Fixed: Conditional Logic and robust type matching.
+    Updated: Uses pandas.eval() for complex AND/OR conditional logic.
     """
     out_df = pd.DataFrame() 
     
@@ -109,24 +109,18 @@ def apply_rules_engine(main_df, rules, mapping_dfs):
                 out_df[target] = main_df[rule['source']]
                 
             elif r_type == "Conditional":
-                # FIXED: Robust Conditional Logic
-                col, op, val = rule['cond_col'], rule['cond_op'], rule['cond_val']
-                series = main_df[col]
-                mask = pd.Series([False] * len(main_df), index=main_df.index)
+                # NEW: Advanced Eval Logic
+                expression = rule['expression']
                 
-                try:
-                    # Try numeric comparison
-                    num_val = float(val)
-                    num_series = pd.to_numeric(series, errors='coerce')
-                    
-                    if op == ">": mask = num_series > num_val
-                    elif op == "<": mask = num_series < num_val
-                    elif op == "==": mask = num_series == num_val
-                except:
-                    # Fallback to string comparison
-                    if op == "==": mask = series.astype(str) == str(val)
-                
-                out_df[target] = mask.map({True: rule['then'], False: rule['else']})
+                # Check if expression is valid
+                if expression:
+                    try:
+                        # pandas.eval() handles complex logic like: (ColA > 10) & (ColB == 'X')
+                        # engine='python' ensures string operations work safely
+                        mask = main_df.eval(expression, engine='python')
+                        out_df[target] = mask.map({True: rule['then'], False: rule['else']})
+                    except Exception as eval_err:
+                        st.error(f"Logic Error in column '{target}': {eval_err}")
                 
             elif r_type == "Lookup":
                 map_name = rule['map_name']
@@ -157,11 +151,13 @@ def run_app(email):
     if 'data_inventory' not in st.session_state: st.session_state.data_inventory = {}
     if 'mapping_dfs' not in st.session_state: st.session_state.mapping_dfs = {}
     
+    # Temp state for building complex conditions
+    if 'temp_expr' not in st.session_state: st.session_state.temp_expr = ""
+
     # --- SIDEBAR: DATA CONNECTIONS ---
     with st.sidebar:
         st.header("1. Data Extraction")
         
-        # FIXED: Radio button ensures user sees the connection options
         extract_mode = st.radio("Source Type", ["Upload Files", "Connect to Server (SFTP)"])
         
         if extract_mode == "Upload Files":
@@ -185,7 +181,6 @@ def run_app(email):
                         with st.spinner("Extracting data..."):
                             df = sftp_action(s_host, s_port, s_user, s_pwd, "extract", s_path)
                             if df is not None:
-                                # Use the filename from the path
                                 fname = s_path.split("/")[-1]
                                 st.session_state.data_inventory[fname] = df
                                 st.success(f"Extracted: {fname}")
@@ -207,10 +202,9 @@ def run_app(email):
             st.rerun()
 
     # --- MAIN WORKSPACE ---
-    # Check if we have any data to work with
     if st.session_state.data_inventory:
         
-        # Select Primary Dataset for Transformation
+        # Select Primary Dataset
         file_options = list(st.session_state.data_inventory.keys())
         selected_file = st.selectbox("Select Primary Data for Pipeline", file_options)
         main_df = st.session_state.data_inventory[selected_file]
@@ -241,26 +235,65 @@ def run_app(email):
         # --- TAB 1: BUILDER ---
         with tab_build:
             with st.expander("➕ Add Logic", expanded=True):
-                # Row 1: Basic Info
                 c1, c2 = st.columns([1, 1])
                 name = c1.text_input("New Column Name")
-                # FIXED: This selectbox now triggers a rerun so the fields below appear instantly
                 r_type = c2.selectbox("Logic Type", ["Direct Map", "Conditional", "Lookup"])
                 
                 rule = {"name": name, "type": r_type}
                 
-                # Dynamic UI based on Type
                 if r_type == "Direct Map":
                     rule['source'] = st.selectbox("Source Column", cols)
                 
                 elif r_type == "Conditional":
-                    # FIXED: Full conditional UI appears here
-                    st.markdown("##### If (Condition) Then (Value) Else (Value)")
-                    ac1, ac2, ac3 = st.columns([1, 1, 1])
-                    rule['cond_col'] = ac1.selectbox("Column", cols)
-                    rule['cond_op'] = ac2.selectbox("Operator", [">", "<", "=="])
-                    rule['cond_val'] = ac3.text_input("Value (e.g. 100 or 'Pending')")
+                    # --- COMPLEX CONDITION BUILDER ---
+                    st.markdown("##### 🛠️ Formula Builder")
+                    st.info("Build logic like: `(Amount > 500) & (Region == 'US')`")
                     
+                    # Display current formula
+                    st.code(st.session_state.temp_expr if st.session_state.temp_expr else "(Empty)")
+                    
+                    # Builder Inputs
+                    cc1, cc2, cc3 = st.columns([2, 1, 2])
+                    b_col = cc1.selectbox("Column", cols, key="b_col")
+                    b_op = cc2.selectbox("Op", ["==", "!=", ">", "<", ">=", "<="], key="b_op")
+                    b_val = cc3.text_input("Value", key="b_val")
+                    
+                    # Helper: Auto-quote string values if user didn't
+                    def format_val(val, df, col):
+                        # Simple heuristic: if input has no quotes but column is object/string, add quotes
+                        if df[col].dtype == 'object':
+                            if not (val.startswith('"') or val.startswith("'")):
+                                return f"'{val}'"
+                        return val
+
+                    bc1, bc2, bc3 = st.columns(3)
+                    if bc1.button("Add (AND)"):
+                        safe_val = format_val(b_val, main_df, b_col)
+                        # Use backticks for columns to handle spaces
+                        segment = f"(`{b_col}` {b_op} {safe_val})"
+                        if st.session_state.temp_expr:
+                            st.session_state.temp_expr += f" & {segment}"
+                        else:
+                            st.session_state.temp_expr = segment
+                        st.rerun()
+
+                    if bc2.button("Add (OR)"):
+                        safe_val = format_val(b_val, main_df, b_col)
+                        segment = f"(`{b_col}` {b_op} {safe_val})"
+                        if st.session_state.temp_expr:
+                            st.session_state.temp_expr += f" | {segment}"
+                        else:
+                            st.session_state.temp_expr = segment
+                        st.rerun()
+                        
+                    if bc3.button("Reset Formula"):
+                        st.session_state.temp_expr = ""
+                        st.rerun()
+
+                    # Save Expression to Rule
+                    rule['expression'] = st.session_state.temp_expr
+                    
+                    st.markdown("---")
                     ac4, ac5 = st.columns(2)
                     rule['then'] = ac4.text_input("Then Output")
                     rule['else'] = ac5.text_input("Else Output")
@@ -272,7 +305,6 @@ def run_app(email):
                         m_names = list(st.session_state.mapping_dfs.keys())
                         rule['map_name'] = st.selectbox("Mapping Table", m_names)
                         rule['in_col'] = st.selectbox("Match Column (Main)", cols)
-                        
                         if rule['map_name']:
                             m_cols = st.session_state.mapping_dfs[rule['map_name']].columns.tolist()
                             rule['key_col'] = st.selectbox("Key Column (Map)", m_cols)
@@ -281,8 +313,13 @@ def run_app(email):
                 # Add Button
                 if st.button("Add Rule"):
                     if name:
-                        st.session_state.rules.append(rule)
-                        st.rerun()
+                        if r_type == "Conditional" and not rule['expression']:
+                            st.error("Please build a formula first (Add AND/OR)")
+                        else:
+                            st.session_state.rules.append(rule)
+                            # Clear temp expr for next rule
+                            st.session_state.temp_expr = ""
+                            st.rerun()
                     else:
                         st.error("Name required")
 
@@ -293,7 +330,7 @@ def run_app(email):
                     rc1, rc2 = st.columns([5,1])
                     info_text = f"**{r['name']}** ({r['type']})"
                     if r['type'] == 'Conditional':
-                        info_text += f" | If {r.get('cond_col')} {r.get('cond_op')} {r.get('cond_val')}"
+                        info_text += f" | Formula: `{r.get('expression')}`"
                     rc1.info(info_text)
                     if rc2.button("🗑️", key=f"del_{i}"):
                         st.session_state.rules.pop(i)

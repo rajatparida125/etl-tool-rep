@@ -16,3 +16,9 @@ paramiko  # For SFTP/SSH
 boto3     # For AWS S3
 psycopg2-binary # For Postgres
 cryptography
+fastparquet
+boto3
+google-cloud-storage
+pyarrow
+sqlalchemy
+psycopg2-binary
