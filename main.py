@@ -1,10 +1,9 @@
 import streamlit as st
 import pandas as pd
 import json
-import requests
 import os
 import paramiko
-from io import BytesIO
+from io import BytesIO, StringIO
 from streamlit_google_auth import Authenticate
 
 # --- 0. AUTH & CREDENTIALS ---
@@ -13,135 +12,336 @@ if "GOOGLE_CREDENTIALS_CONTENT" in st.secrets:
         with open("google_credentials.json", "w") as f:
             f.write(st.secrets["GOOGLE_CREDENTIALS_CONTENT"])
 
-st.set_page_config(page_title="KinetiBridge Pro ETL", layout="wide", page_icon="🌐")
+st.set_page_config(page_title="KinetiBridge Universal ETL", layout="wide", page_icon="🌉")
+
+# --- AUTH SETUP ---
+# For Cloud Deployment, we hardcode the production URL to prevent detection errors.
+# If you want to run locally later, just swap the comment # to the other line.
+
+# redirect_uri = "http://localhost:8501/oauth2callback" # <--- UNCOMMENT FOR LOCAL TESTING
+redirect_uri = "https://etl-tool-rep-4p2dkdcahg8ltcnnrukfge.streamlit.app/oauth2callback" # <--- ACTIVE FOR CLOUD
 
 authenticator = Authenticate(
     secret_credentials_path='google_credentials.json',
     cookie_name='kineti_auth_cookie',
     cookie_key='kinetibridge_secret_key', 
-    redirect_uri="https://etl-tool-rep-4p2dkdcahg8ltcnnrukfge.streamlit.app/oauth2callback"
+    redirect_uri=redirect_uri
 )
 authenticator.check_authentification()
 
-# --- 1. CORE ETL UTILITIES ---
-def smart_load(file_source, filename):
-    ext = filename.split('.')[-1].lower()
+# --- 1. SMART DATA HANDLER ---
+def smart_load(file_obj, filename, file_type_override=None):
+    """
+    Robust loader for CSV, Pipe, Excel, JSON, Parquet.
+    """
     try:
-        if ext == 'csv': return pd.read_csv(file_source)
-        if ext in ['xlsx', 'xls']: return pd.read_excel(file_source)
-        if ext == 'json': return pd.read_json(file_source)
+        ext = filename.split('.')[-1].lower() if filename else ""
+        
+        if ext == 'csv' or file_type_override == 'csv':
+            return pd.read_csv(file_obj)
+        elif ext == 'txt' or file_type_override == 'pipe':
+            return pd.read_csv(file_obj, sep='|') 
+        elif ext in ['xlsx', 'xls'] or file_type_override == 'excel':
+            return pd.read_excel(file_obj)
+        elif ext == 'json' or file_type_override == 'json':
+            return pd.read_json(file_obj)
+        elif ext == 'parquet' or file_type_override == 'parquet':
+            return pd.read_parquet(file_obj)
+        else:
+            try:
+                return pd.read_csv(file_obj, sep=None, engine='python')
+            except:
+                st.error(f"❌ Unsupported file type: {filename}")
+                return None
     except Exception as e:
-        st.error(f"Error loading {filename}: {e}")
-    return None
+        st.error(f"Error loading {filename}: {str(e)}")
+        return None
 
-def apply_rules(df, rules, mappings):
-    out_df = pd.DataFrame()
-    for r in rules:
+# --- 2. SERVER CONNECTIVITY (SFTP) ---
+def sftp_action(host, port, user, password, action, remote_path, local_data=None):
+    """
+    Handles both Extract (Get) and Load (Put) via SFTP
+    """
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        ssh.connect(host, port=int(port), username=user, password=password)
+        sftp = ssh.open_sftp()
+        
+        if action == "extract":
+            with sftp.open(remote_path, "rb") as f:
+                content = BytesIO(f.read())
+                df = smart_load(content, remote_path)
+            sftp.close()
+            ssh.close()
+            return df
+            
+        elif action == "load":
+            with sftp.open(remote_path, "w") as f:
+                csv_buffer = StringIO()
+                local_data.to_csv(csv_buffer, index=False)
+                f.write(csv_buffer.getvalue())
+            sftp.close()
+            ssh.close()
+            return True
+            
+    except Exception as e:
+        st.error(f"SFTP Connection Error: {str(e)}")
+        return None
+
+# --- 3. TRANSFORMATION ENGINE ---
+def apply_rules_engine(main_df, rules, mapping_dfs):
+    """
+    Applies transformation logic.
+    Fixed: Conditional Logic and robust type matching.
+    """
+    out_df = pd.DataFrame() 
+    
+    if not main_df.empty:
+        out_df = pd.DataFrame(index=main_df.index)
+
+    for rule in rules:
         try:
-            name = r['name']
-            if r['type'] == "Direct Map":
-                out_df[name] = df[r['source']]
-            elif r['type'] == "Lookup":
-                m_df = mappings.get(r['map_name'])
-                if m_df is not None:
-                    lookup = m_df.set_index(r['key_col'])[r['val_col']].to_dict()
-                    out_df[name] = df[r['in_col']].map(lookup)
-            elif r['type'] == "Conditional":
-                # Basic conditional logic
-                c, op, v = r['cond_col'], r['cond_op'], r['cond_val']
-                if op == ">": mask = df[c] > float(v)
-                elif op == "<": mask = df[c] < float(v)
-                else: mask = df[c] == v
-                out_df[name] = mask.map({True: r['then'], False: r['else']})
+            target = rule['name']
+            r_type = rule['type']
+            
+            if r_type == "Direct Map":
+                out_df[target] = main_df[rule['source']]
+                
+            elif r_type == "Conditional":
+                # FIXED: Robust Conditional Logic
+                col, op, val = rule['cond_col'], rule['cond_op'], rule['cond_val']
+                series = main_df[col]
+                mask = pd.Series([False] * len(main_df), index=main_df.index)
+                
+                try:
+                    # Try numeric comparison
+                    num_val = float(val)
+                    num_series = pd.to_numeric(series, errors='coerce')
+                    
+                    if op == ">": mask = num_series > num_val
+                    elif op == "<": mask = num_series < num_val
+                    elif op == "==": mask = num_series == num_val
+                except:
+                    # Fallback to string comparison
+                    if op == "==": mask = series.astype(str) == str(val)
+                
+                out_df[target] = mask.map({True: rule['then'], False: rule['else']})
+                
+            elif r_type == "Lookup":
+                map_name = rule['map_name']
+                if map_name in mapping_dfs:
+                    m_df = mapping_dfs[map_name]
+                    key_col = rule['key_col']
+                    val_col = rule['val_col']
+                    input_col = rule['in_col']
+                    
+                    # Robust lookup: Convert keys to string
+                    lookup_dict = dict(zip(m_df[key_col].astype(str), m_df[val_col]))
+                    out_df[target] = main_df[input_col].astype(str).map(lookup_dict)
+                else:
+                    st.warning(f"Mapping table '{map_name}' not found.")
+                    
         except Exception as e:
-            st.warning(f"Skipping rule '{r.get('name')}': {e}")
+            st.error(f"Rule Execution Failed ({rule.get('name')}): {e}")
+            
     return out_df
 
-# --- 2. MAIN APPLICATION UI ---
+# --- 4. UI & STATE MANAGEMENT ---
 def run_app(email):
     st.title("🚀 KinetiBridge Pro ETL")
+    st.caption(f"Logged in as: {email}")
     
-    # Persistent State
+    # Session State
     if 'rules' not in st.session_state: st.session_state.rules = []
-    if 'input_dfs' not in st.session_state: st.session_state.input_dfs = {}
-
+    if 'data_inventory' not in st.session_state: st.session_state.data_inventory = {}
+    if 'mapping_dfs' not in st.session_state: st.session_state.mapping_dfs = {}
+    
+    # --- SIDEBAR: DATA CONNECTIONS ---
     with st.sidebar:
-        st.header("📥 Data Sources")
-        uploaded_files = st.file_uploader("Extract Files (CSV, XLSX, JSON)", accept_multiple_files=True)
-        if uploaded_files:
-            for f in uploaded_files:
-                st.session_state.input_dfs[f.name] = smart_load(f, f.name)
+        st.header("1. Data Extraction")
         
+        # FIXED: Radio button ensures user sees the connection options
+        extract_mode = st.radio("Source Type", ["Upload Files", "Connect to Server (SFTP)"])
+        
+        if extract_mode == "Upload Files":
+            uploaded_files = st.file_uploader("Upload Input Data", accept_multiple_files=True, type=['csv','txt','xlsx','json','parquet'])
+            if uploaded_files:
+                for f in uploaded_files:
+                    st.session_state.data_inventory[f.name] = smart_load(f, f.name)
+                st.success(f"Loaded {len(uploaded_files)} files.")
+
+        elif extract_mode == "Connect to Server (SFTP)":
+            st.markdown("##### 🔌 SFTP Connection")
+            with st.expander("Server Config", expanded=True):
+                s_host = st.text_input("Host IP/URL", key="s_host")
+                s_port = st.text_input("Port", "22", key="s_port")
+                s_user = st.text_input("Username", key="s_user")
+                s_pwd = st.text_input("Password", type="password", key="s_pwd")
+                s_path = st.text_input("Remote File Path", key="s_path")
+                
+                if st.button("Connect & Extract"):
+                    if s_host and s_user and s_path:
+                        with st.spinner("Extracting data..."):
+                            df = sftp_action(s_host, s_port, s_user, s_pwd, "extract", s_path)
+                            if df is not None:
+                                # Use the filename from the path
+                                fname = s_path.split("/")[-1]
+                                st.session_state.data_inventory[fname] = df
+                                st.success(f"Extracted: {fname}")
+                    else:
+                        st.error("Missing credentials")
+
         st.divider()
-        st.header("💾 Pipeline Management")
+        st.header("2. Mapping Tables")
+        m_files = st.file_uploader("Upload Lookups", accept_multiple_files=True, key="maps")
+        if m_files:
+            for mf in m_files:
+                m_key = mf.name.split('.')[0]
+                if m_key not in st.session_state.mapping_dfs:
+                    st.session_state.mapping_dfs[m_key] = smart_load(mf, mf.name)
         
-        # SAVE RULES
-        if st.session_state.rules:
-            pipeline_json = json.dumps(st.session_state.rules, indent=2)
-            st.download_button("📂 Export Pipeline (JSON)", pipeline_json, "pipeline.json", "application/json")
-        
-        # LOAD RULES
-        loaded_pipeline = st.file_uploader("📥 Import Pipeline", type=['json'])
-        if loaded_pipeline:
-            st.session_state.rules = json.load(loaded_pipeline)
-            st.success("Pipeline loaded!")
-            
         st.divider()
         if st.button("Logout"):
             authenticator.logout()
             st.rerun()
 
-    if st.session_state.input_dfs:
-        main_source = st.selectbox("Select Primary File", list(st.session_state.input_dfs.keys()))
-        df = st.session_state.input_dfs[main_source]
-        cols = df.columns.tolist()
-
-        t_build, t_preview, t_export = st.tabs(["🏗️ Builder", "🔭 Preview", "🚀 Load"])
+    # --- MAIN WORKSPACE ---
+    # Check if we have any data to work with
+    if st.session_state.data_inventory:
         
-        with t_build:
+        # Select Primary Dataset for Transformation
+        file_options = list(st.session_state.data_inventory.keys())
+        selected_file = st.selectbox("Select Primary Data for Pipeline", file_options)
+        main_df = st.session_state.data_inventory[selected_file]
+        cols = main_df.columns.tolist()
+        
+        st.divider()
+        
+        # RULES IMPORT / EXPORT
+        col_imp, col_exp = st.columns([1, 1])
+        with col_imp:
+            uploaded_rules = st.file_uploader("📥 Import Pipeline (JSON)", type=['json'], label_visibility="collapsed")
+            if uploaded_rules:
+                try:
+                    loaded = json.load(uploaded_rules)
+                    st.session_state.rules = loaded
+                    st.toast("Pipeline Loaded!", icon="✅")
+                except:
+                    st.error("Invalid JSON")
+
+        with col_exp:
+            if st.session_state.rules:
+                rules_json = json.dumps(st.session_state.rules, indent=2)
+                st.download_button("💾 Export Pipeline (JSON)", rules_json, "pipeline.json", "application/json", use_container_width=True)
+
+        # TABS
+        tab_build, tab_run, tab_load = st.tabs(["🏗️ Builder", "👁️ Preview", "🚀 Load / Export"])
+        
+        # --- TAB 1: BUILDER ---
+        with tab_build:
             with st.expander("➕ Add Logic", expanded=True):
-                c1, c2 = st.columns(2)
-                r_name = c1.text_input("New Column Name")
-                r_type = c2.selectbox("Type", ["Direct Map", "Lookup", "Conditional"])
+                # Row 1: Basic Info
+                c1, c2 = st.columns([1, 1])
+                name = c1.text_input("New Column Name")
+                # FIXED: This selectbox now triggers a rerun so the fields below appear instantly
+                r_type = c2.selectbox("Logic Type", ["Direct Map", "Conditional", "Lookup"])
                 
-                rule = {"name": r_name, "type": r_type}
+                rule = {"name": name, "type": r_type}
+                
+                # Dynamic UI based on Type
                 if r_type == "Direct Map":
-                    rule['source'] = st.selectbox("Source", cols)
-                elif r_type == "Lookup":
-                    rule['map_name'] = st.selectbox("Map Table", list(st.session_state.input_dfs.keys()))
-                    rule['in_col'] = st.selectbox("Input Key", cols)
-                    m_cols = st.session_state.input_dfs[rule['map_name']].columns.tolist()
-                    rule['key_col'] = st.selectbox("Map Key", m_cols)
-                    rule['val_col'] = st.selectbox("Map Value", m_cols)
+                    rule['source'] = st.selectbox("Source Column", cols)
                 
+                elif r_type == "Conditional":
+                    # FIXED: Full conditional UI appears here
+                    st.markdown("##### If (Condition) Then (Value) Else (Value)")
+                    ac1, ac2, ac3 = st.columns([1, 1, 1])
+                    rule['cond_col'] = ac1.selectbox("Column", cols)
+                    rule['cond_op'] = ac2.selectbox("Operator", [">", "<", "=="])
+                    rule['cond_val'] = ac3.text_input("Value (e.g. 100 or 'Pending')")
+                    
+                    ac4, ac5 = st.columns(2)
+                    rule['then'] = ac4.text_input("Then Output")
+                    rule['else'] = ac5.text_input("Else Output")
+
+                elif r_type == "Lookup":
+                    if not st.session_state.mapping_dfs:
+                        st.warning("No mappings uploaded in Sidebar.")
+                    else:
+                        m_names = list(st.session_state.mapping_dfs.keys())
+                        rule['map_name'] = st.selectbox("Mapping Table", m_names)
+                        rule['in_col'] = st.selectbox("Match Column (Main)", cols)
+                        
+                        if rule['map_name']:
+                            m_cols = st.session_state.mapping_dfs[rule['map_name']].columns.tolist()
+                            rule['key_col'] = st.selectbox("Key Column (Map)", m_cols)
+                            rule['val_col'] = st.selectbox("Value Column (Map)", m_cols)
+
+                # Add Button
                 if st.button("Add Rule"):
-                    st.session_state.rules.append(rule)
-                    st.rerun()
+                    if name:
+                        st.session_state.rules.append(rule)
+                        st.rerun()
+                    else:
+                        st.error("Name required")
 
-            st.write("Current Rules:")
-            for i, r in enumerate(st.session_state.rules):
-                rc1, rc2 = st.columns([5,1])
-                rc1.info(f"{r['name']} ({r['type']})")
-                if rc2.button("🗑️", key=f"del_{i}"):
-                    st.session_state.rules.pop(i)
-                    st.rerun()
+            # List Active Rules
+            if st.session_state.rules:
+                st.write("### Active Rules")
+                for i, r in enumerate(st.session_state.rules):
+                    rc1, rc2 = st.columns([5,1])
+                    info_text = f"**{r['name']}** ({r['type']})"
+                    if r['type'] == 'Conditional':
+                        info_text += f" | If {r.get('cond_col')} {r.get('cond_op')} {r.get('cond_val')}"
+                    rc1.info(info_text)
+                    if rc2.button("🗑️", key=f"del_{i}"):
+                        st.session_state.rules.pop(i)
+                        st.rerun()
 
-        with t_preview:
-            if st.button("▶️ EXECUTE PIPELINE"):
-                st.session_state.result_df = apply_rules(df, st.session_state.rules, st.session_state.input_dfs)
+        # --- TAB 2: PREVIEW ---
+        with tab_run:
+            if st.button("▶️ RUN PIPELINE", type="primary"):
+                st.session_state.result_df = apply_rules_engine(
+                    main_df, st.session_state.rules, st.session_state.mapping_dfs
+                )
+            
             if 'result_df' in st.session_state:
-                st.dataframe(st.session_state.result_df)
+                st.dataframe(st.session_state.result_df.head(100), use_container_width=True)
 
-        with t_export:
-            if 'result_df' in st.session_state:
-                csv = st.session_state.result_df.to_csv(index=False).encode('utf-8')
-                st.download_button("💾 Download Results", csv, "output.csv")
+        # --- TAB 3: LOAD / EXPORT ---
+        with tab_load:
+            st.header("Data Loading")
+            load_mode = st.radio("Destination", ["Download File", "Push to Server (SFTP)"])
+            
+            if load_mode == "Download File":
+                if 'result_df' in st.session_state:
+                    csv_data = st.session_state.result_df.to_csv(index=False).encode('utf-8')
+                    st.download_button("📥 Download CSV", csv_data, "output.csv")
+                else:
+                    st.warning("Run Pipeline first.")
+            
+            elif load_mode == "Push to Server (SFTP)":
+                st.markdown("##### 📤 SFTP Destination")
+                lc1, lc2 = st.columns(2)
+                d_host = lc1.text_input("Dest Host", key="d_host")
+                d_user = lc2.text_input("Dest User", key="d_user")
+                d_pwd = st.text_input("Dest Password", type="password", key="d_pwd")
+                d_path = st.text_input("Dest Path (e.g. /home/out.csv)", key="d_path")
+                
+                if st.button("🚀 Push to Server"):
+                    if 'result_df' in st.session_state and d_host:
+                        success = sftp_action(d_host, "22", d_user, d_pwd, "load", d_path, st.session_state.result_df)
+                        if success: st.success("Upload Successful!")
+                    else:
+                        st.error("Missing Data or Credentials")
+
     else:
-        st.info("Upload your source files to begin.")
+        st.info("👈 Please Extract Data using the Sidebar to begin.")
 
-# --- 3. GATEKEEPER ---
+# --- GATEKEEPER ---
 if st.session_state.get('connected'):
     run_app(st.session_state['user_info'].get('email'))
 else:
-    st.title("Welcome to KinetiBridge")
+    st.title("Login to KinetiBridge")
     authenticator.login()
