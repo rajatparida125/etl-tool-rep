@@ -3,7 +3,6 @@ import pandas as pd
 import json
 import os
 import paramiko
-import socket
 from io import BytesIO, StringIO
 from streamlit_google_auth import Authenticate
 
@@ -66,7 +65,6 @@ def sftp_action(host, port, user, password, action, remote_path, local_data=None
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
-        # socket.setdefaulttimeout(10) # Optional timeout
         ssh.connect(host, port=int(port), username=user, password=password)
         sftp = ssh.open_sftp()
         
@@ -112,7 +110,9 @@ def apply_rules_engine(main_df, rules, mapping_dfs):
                 out_df[target] = main_df[rule['source']]
                 
             elif r_type == "Conditional":
+                # Advanced Eval Logic for AND/OR support
                 expression = rule.get('expression')
+                
                 if expression:
                     try:
                         mask = main_df.eval(expression, engine='python')
@@ -128,7 +128,7 @@ def apply_rules_engine(main_df, rules, mapping_dfs):
                     val_col = rule['val_col']
                     input_col = rule['in_col']
                     
-                    # Robust lookup
+                    # Robust lookup: Convert keys to string
                     lookup_dict = dict(zip(m_df[key_col].astype(str), m_df[val_col]))
                     out_df[target] = main_df[input_col].astype(str).map(lookup_dict)
                 else:
@@ -139,7 +139,30 @@ def apply_rules_engine(main_df, rules, mapping_dfs):
             
     return out_df
 
-# --- 4. UI & STATE MANAGEMENT ---
+# --- 4. LEGAL & TERMS FOOTER ---
+def show_legal_footer():
+    st.markdown("---")
+    with st.expander("📜 Legal Notices, Terms of Service & Privacy Policy", expanded=False):
+        st.markdown("""
+        ### 1. Terms of Service
+        By using **KinetiBridge Universal ETL** ("the Service"), you agree to the following terms:
+        * **"As Is" Basis:** The Service is provided "as is" without warranty of any kind, express or implied.
+        * **No Liability:** The developers of KinetiBridge shall not be liable for any damages, data loss, or server issues arising from the use of this tool.
+        * **User Responsibility:** You are solely responsible for the data you upload and the server credentials you provide.
+        
+        ### 2. Privacy Policy & Data Handling
+        * **Data Persistence:** We **do not** permanently store your uploaded files. All data is processed in temporary memory (RAM) and is discarded when your session ends or you reload the page.
+        * **Server Credentials:** SFTP hostnames, usernames, and passwords entered in this application are **not saved** to any database. They are used strictly for the duration of the active session to establish connections you request.
+        * **Google Auth:** We use Google OAuth solely for authentication. We do not access your emails or Drive files unless explicitly granted.
+
+        ### 3. Server Connectivity Disclaimer
+        * **Firewalls:** This application runs on a dynamic cloud environment. To connect to your private SFTP servers, you may need to whitelist the dynamic IP of this instance or allow public access.
+        * **Security:** Ensure you use strong passwords. We recommend using temporary credentials when connecting via third-party tools.
+        
+        *Last Updated: 2026*
+        """)
+
+# --- 5. UI & STATE MANAGEMENT ---
 def run_app(email):
     st.title("🚀 KinetiBridge Pro ETL")
     st.caption(f"Logged in as: {email}")
@@ -187,7 +210,7 @@ def run_app(email):
         st.divider()
         st.header("2. Mapping Tables")
         
-        # --- MAPPING SOURCE (NEW FEATURE) ---
+        # --- MAPPING SOURCE (Extract from Server Added) ---
         map_source = st.radio("Mapping Source", ["Upload Lookups", "Download from Server (SFTP)"])
         
         if map_source == "Upload Lookups":
@@ -378,9 +401,13 @@ def run_app(email):
     else:
         st.info("👈 Please Extract Data using the Sidebar to begin.")
 
+    # --- SHOW LEGAL FOOTER ---
+    show_legal_footer()
+
 # --- GATEKEEPER ---
 if st.session_state.get('connected'):
     run_app(st.session_state['user_info'].get('email'))
 else:
     st.title("Login to KinetiBridge")
+    show_legal_footer() # Ensure legal footer is visible even on login screen
     authenticator.login()
