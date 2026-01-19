@@ -3,6 +3,7 @@ import pandas as pd
 import json
 import os
 import paramiko
+import socket
 from io import BytesIO, StringIO
 from streamlit_google_auth import Authenticate
 
@@ -65,6 +66,7 @@ def sftp_action(host, port, user, password, action, remote_path, local_data=None
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
+        # socket.setdefaulttimeout(10) # Optional timeout
         ssh.connect(host, port=int(port), username=user, password=password)
         sftp = ssh.open_sftp()
         
@@ -87,13 +89,14 @@ def sftp_action(host, port, user, password, action, remote_path, local_data=None
             
     except Exception as e:
         st.error(f"SFTP Connection Error: {str(e)}")
+        st.caption("Tip: Ensure your server firewall allows connections from this IP.")
         return None
 
 # --- 3. TRANSFORMATION ENGINE ---
 def apply_rules_engine(main_df, rules, mapping_dfs):
     """
     Applies transformation logic.
-    Updated: Uses pandas.eval() for complex AND/OR conditional logic.
+    Uses pandas.eval() for complex AND/OR conditional logic.
     """
     out_df = pd.DataFrame() 
     
@@ -109,14 +112,9 @@ def apply_rules_engine(main_df, rules, mapping_dfs):
                 out_df[target] = main_df[rule['source']]
                 
             elif r_type == "Conditional":
-                # NEW: Advanced Eval Logic
-                expression = rule['expression']
-                
-                # Check if expression is valid
+                expression = rule.get('expression')
                 if expression:
                     try:
-                        # pandas.eval() handles complex logic like: (ColA > 10) & (ColB == 'X')
-                        # engine='python' ensures string operations work safely
                         mask = main_df.eval(expression, engine='python')
                         out_df[target] = mask.map({True: rule['then'], False: rule['else']})
                     except Exception as eval_err:
@@ -130,7 +128,7 @@ def apply_rules_engine(main_df, rules, mapping_dfs):
                     val_col = rule['val_col']
                     input_col = rule['in_col']
                     
-                    # Robust lookup: Convert keys to string
+                    # Robust lookup
                     lookup_dict = dict(zip(m_df[key_col].astype(str), m_df[val_col]))
                     out_df[target] = main_df[input_col].astype(str).map(lookup_dict)
                 else:
@@ -150,15 +148,14 @@ def run_app(email):
     if 'rules' not in st.session_state: st.session_state.rules = []
     if 'data_inventory' not in st.session_state: st.session_state.data_inventory = {}
     if 'mapping_dfs' not in st.session_state: st.session_state.mapping_dfs = {}
-    
-    # Temp state for building complex conditions
     if 'temp_expr' not in st.session_state: st.session_state.temp_expr = ""
 
     # --- SIDEBAR: DATA CONNECTIONS ---
     with st.sidebar:
         st.header("1. Data Extraction")
         
-        extract_mode = st.radio("Source Type", ["Upload Files", "Connect to Server (SFTP)"])
+        # --- MAIN DATA SOURCE ---
+        extract_mode = st.radio("Main Source Type", ["Upload Files", "Connect to Server (SFTP)"])
         
         if extract_mode == "Upload Files":
             uploaded_files = st.file_uploader("Upload Input Data", accept_multiple_files=True, type=['csv','txt','xlsx','json','parquet'])
@@ -189,13 +186,38 @@ def run_app(email):
 
         st.divider()
         st.header("2. Mapping Tables")
-        m_files = st.file_uploader("Upload Lookups", accept_multiple_files=True, key="maps")
-        if m_files:
-            for mf in m_files:
-                m_key = mf.name.split('.')[0]
-                if m_key not in st.session_state.mapping_dfs:
-                    st.session_state.mapping_dfs[m_key] = smart_load(mf, mf.name)
         
+        # --- MAPPING SOURCE (NEW FEATURE) ---
+        map_source = st.radio("Mapping Source", ["Upload Lookups", "Download from Server (SFTP)"])
+        
+        if map_source == "Upload Lookups":
+            m_files = st.file_uploader("Upload Files", accept_multiple_files=True, key="maps")
+            if m_files:
+                for mf in m_files:
+                    m_key = mf.name.split('.')[0]
+                    if m_key not in st.session_state.mapping_dfs:
+                        st.session_state.mapping_dfs[m_key] = smart_load(mf, mf.name)
+        
+        elif map_source == "Download from Server (SFTP)":
+            with st.expander("Mapping Server Config"):
+                ms_host = st.text_input("Host", key="ms_host")
+                ms_port = st.text_input("Port", "22", key="ms_port")
+                ms_user = st.text_input("User", key="ms_user")
+                ms_pwd = st.text_input("Pwd", type="password", key="ms_pwd")
+                ms_path = st.text_input("Path", key="ms_path")
+                
+                if st.button("Load Mapping"):
+                    if ms_host and ms_user and ms_path:
+                        with st.spinner("Downloading Mapping..."):
+                            m_df = sftp_action(ms_host, ms_port, ms_user, ms_pwd, "extract", ms_path)
+                            if m_df is not None:
+                                m_name = ms_path.split("/")[-1].split('.')[0]
+                                st.session_state.mapping_dfs[m_name] = m_df
+                                st.success(f"Mapping '{m_name}' Loaded")
+
+        if st.session_state.mapping_dfs:
+            st.info(f"Loaded {len(st.session_state.mapping_dfs)} mapping tables.")
+
         st.divider()
         if st.button("Logout"):
             authenticator.logout()
@@ -245,62 +267,45 @@ def run_app(email):
                     rule['source'] = st.selectbox("Source Column", cols)
                 
                 elif r_type == "Conditional":
-                    # --- COMPLEX CONDITION BUILDER ---
                     st.markdown("##### 🛠️ Formula Builder")
-                    st.info("Build logic like: `(Amount > 500) & (Region == 'US')`")
-                    
-                    # Display current formula
+                    st.caption("Example: `(Amount > 500) & (Status == 'Active')`")
                     st.code(st.session_state.temp_expr if st.session_state.temp_expr else "(Empty)")
                     
-                    # Builder Inputs
                     cc1, cc2, cc3 = st.columns([2, 1, 2])
                     b_col = cc1.selectbox("Column", cols, key="b_col")
                     b_op = cc2.selectbox("Op", ["==", "!=", ">", "<", ">=", "<="], key="b_op")
                     b_val = cc3.text_input("Value", key="b_val")
                     
-                    # Helper: Auto-quote string values if user didn't
                     def format_val(val, df, col):
-                        # Simple heuristic: if input has no quotes but column is object/string, add quotes
-                        if df[col].dtype == 'object':
-                            if not (val.startswith('"') or val.startswith("'")):
-                                return f"'{val}'"
+                        if df[col].dtype == 'object' and not (val.startswith('"') or val.startswith("'")):
+                            return f"'{val}'"
                         return val
 
                     bc1, bc2, bc3 = st.columns(3)
                     if bc1.button("Add (AND)"):
                         safe_val = format_val(b_val, main_df, b_col)
-                        # Use backticks for columns to handle spaces
                         segment = f"(`{b_col}` {b_op} {safe_val})"
-                        if st.session_state.temp_expr:
-                            st.session_state.temp_expr += f" & {segment}"
-                        else:
-                            st.session_state.temp_expr = segment
+                        st.session_state.temp_expr = f"{st.session_state.temp_expr} & {segment}" if st.session_state.temp_expr else segment
                         st.rerun()
 
                     if bc2.button("Add (OR)"):
                         safe_val = format_val(b_val, main_df, b_col)
                         segment = f"(`{b_col}` {b_op} {safe_val})"
-                        if st.session_state.temp_expr:
-                            st.session_state.temp_expr += f" | {segment}"
-                        else:
-                            st.session_state.temp_expr = segment
+                        st.session_state.temp_expr = f"{st.session_state.temp_expr} | {segment}" if st.session_state.temp_expr else segment
                         st.rerun()
                         
-                    if bc3.button("Reset Formula"):
+                    if bc3.button("Reset"):
                         st.session_state.temp_expr = ""
                         st.rerun()
 
-                    # Save Expression to Rule
                     rule['expression'] = st.session_state.temp_expr
-                    
-                    st.markdown("---")
                     ac4, ac5 = st.columns(2)
                     rule['then'] = ac4.text_input("Then Output")
                     rule['else'] = ac5.text_input("Else Output")
 
                 elif r_type == "Lookup":
                     if not st.session_state.mapping_dfs:
-                        st.warning("No mappings uploaded in Sidebar.")
+                        st.warning("No mappings available.")
                     else:
                         m_names = list(st.session_state.mapping_dfs.keys())
                         rule['map_name'] = st.selectbox("Mapping Table", m_names)
@@ -310,27 +315,24 @@ def run_app(email):
                             rule['key_col'] = st.selectbox("Key Column (Map)", m_cols)
                             rule['val_col'] = st.selectbox("Value Column (Map)", m_cols)
 
-                # Add Button
                 if st.button("Add Rule"):
                     if name:
                         if r_type == "Conditional" and not rule['expression']:
-                            st.error("Please build a formula first (Add AND/OR)")
+                            st.error("Formula cannot be empty")
                         else:
                             st.session_state.rules.append(rule)
-                            # Clear temp expr for next rule
                             st.session_state.temp_expr = ""
                             st.rerun()
                     else:
                         st.error("Name required")
 
-            # List Active Rules
             if st.session_state.rules:
                 st.write("### Active Rules")
                 for i, r in enumerate(st.session_state.rules):
                     rc1, rc2 = st.columns([5,1])
                     info_text = f"**{r['name']}** ({r['type']})"
                     if r['type'] == 'Conditional':
-                        info_text += f" | Formula: `{r.get('expression')}`"
+                        info_text += f" | `{r.get('expression')}`"
                     rc1.info(info_text)
                     if rc2.button("🗑️", key=f"del_{i}"):
                         st.session_state.rules.pop(i)
