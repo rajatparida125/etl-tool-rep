@@ -2,35 +2,32 @@ import streamlit as st
 import pandas as pd
 import json
 import requests
+import os
 from sqlalchemy import create_engine
 from streamlit_google_auth import Authenticate
-import os
 
-# Create the credentials file from secrets if it doesn't exist (Production)
-if not os.path.exists("google_credentials.json"):
-    with open("google_credentials.json", "w") as f:
-        f.write(st.secrets["GOOGLE_CREDENTIALS_CONTENT"])
+# --- 0. PRODUCTION CREDENTIALS RECONSTRUCTION ---
+if "GOOGLE_CREDENTIALS_CONTENT" in st.secrets:
+    if not os.path.exists("google_credentials.json"):
+        with open("google_credentials.json", "w") as f:
+            f.write(st.secrets["GOOGLE_CREDENTIALS_CONTENT"])
 
 # --- 1. CONFIGURATION ---
 st.set_page_config(page_title="KinetiBridge ETL Pro", layout="wide", page_icon="🌐")
 
-# Fetching secrets for Paddle (Keep these in your .streamlit/secrets.toml)
 PADDLE_API_KEY = st.secrets.get("PADDLE_API_KEY", "")
 
 # --- 2. AUTHENTICATION ---
-# Note: Ensure 'google_credentials.json' is in your root folder
 authenticator = Authenticate(
     secret_credentials_path='google_credentials.json',
     cookie_name='kineti_auth_cookie',
     cookie_key='kinetibridge_secret_key', 
-    redirect_uri="https://etl-tool-rep-4p2dkdcahg8ltcnnrukfge.streamlit.app/oauth2callback" # Change to your live URL for deployment
+    redirect_uri="https://etl-tool-rep-4p2dkdcahg8ltcnnrukfge.streamlit.app/oauth2callback"
 )
 
-# Use the correct method name for the latest version
 authenticator.check_authentification()
 
 def is_subscribed(email):
-    # For testing, return True. For production, use Paddle API logic.
     return True 
 
 # --- 3. ETL ENGINE FUNCTIONS ---
@@ -41,7 +38,6 @@ def load_data(file_obj, name):
     return None
 
 def apply_visual_rules(df, rules, mapping_files):
-    """Executes the visual rules built in the UI"""
     out_df = pd.DataFrame()
     for r in rules:
         target_name = r['name']
@@ -53,19 +49,18 @@ def apply_visual_rules(df, rules, mapping_files):
         elif mode == "Conditional":
             mask = pd.Series([True] * len(df))
             col, op, val = r['cond_col'], r['cond_op'], r['cond_val']
-            
             try:
                 comp_val = float(val) if str(val).replace('.','',1).isdigit() else val
                 if op == ">": mask = df[col] > comp_val
                 elif op == "<": mask = df[col] < comp_val
                 elif op == "==": mask = df[col] == comp_val
             except: pass
-            
             out_df[target_name] = mask.map({True: r['then'], False: r['else']})
             
         elif mode == "Lookup":
             m_df = mapping_files.get(r['map_name'])
             if m_df is not None:
+                # Use mapping file logic
                 lookup_dict = m_df.set_index(r['key_col'])[r['val_col']].to_dict()
                 out_df[target_name] = df[r['in_col']].map(lookup_dict)
                 
@@ -76,21 +71,42 @@ def run_etl_app(email):
     st.title("🌐 KinetiBridge Visual ETL")
     st.sidebar.info(f"User: {email}")
 
-    if 'rules' not in st.session_state:
-        st.session_state.rules = []
-    
-    mapping_files = {}
+    # Initialize session states
+    if 'rules' not in st.session_state: st.session_state.rules = []
+    if 'mapping_files' not in st.session_state: st.session_state.mapping_files = {}
+
     with st.sidebar:
         st.header("🔌 Source Data")
         uploaded_file = st.file_uploader("Upload Main File", type=['csv', 'xlsx'])
         
         st.divider()
-        st.header("🗂️ Lookup Mappings")
-        if st.checkbox("Add Lookup Tables"):
-            m_file = st.file_uploader("Upload Mapping", type=['csv', 'xlsx'])
-            m_name = st.text_input("Map Name", "customer_map")
-            if m_file: mapping_files[m_name] = load_data(m_file, m_file.name)
+        st.header("🗂️ Multi-Mapping Manager")
         
+        # UI for adding multiple mapping files
+        with st.expander("Add New Mapping Table"):
+            m_file = st.file_uploader("Upload Lookup File", type=['csv', 'xlsx'], key="m_uploader")
+            m_name = st.text_input("Mapping Name (Unique)", placeholder="e.g. region_codes")
+            if st.button("💾 Save Mapping"):
+                if m_file and m_name:
+                    if m_name in st.session_state.mapping_files:
+                        st.error("Name already exists!")
+                    else:
+                        st.session_state.mapping_files[m_name] = load_data(m_file, m_file.name)
+                        st.success(f"Added {m_name}")
+                else:
+                    st.error("Missing file or name")
+
+        # Display and manage current mappings
+        if st.session_state.mapping_files:
+            st.write("Current Mappings:")
+            for m in list(st.session_state.mapping_files.keys()):
+                col_m1, col_m2 = st.columns([3, 1])
+                col_m1.caption(f"📍 {m}")
+                if col_m2.button("🗑️", key=f"del_m_{m}"):
+                    del st.session_state.mapping_files[m]
+                    st.rerun()
+        
+        st.divider()
         if st.button("Logout"):
             authenticator.logout()
             st.rerun()
@@ -121,15 +137,23 @@ def run_etl_app(email):
                     rule_data['then'] = r4.text_input("Then Result")
                     rule_data['else'] = r5.text_input("Else Result")
                 elif rule_type == "Lookup":
-                    rule_data['map_name'] = st.selectbox("Using Map", list(mapping_files.keys()))
-                    rule_data['in_col'] = st.selectbox("Input Column (Main)", cols)
-                    rule_data['key_col'] = st.text_input("Key Column (Map)")
-                    rule_data['val_col'] = st.text_input("Value Column (Map)")
+                    if not st.session_state.mapping_files:
+                        st.warning("⚠️ Please add a mapping table in the sidebar first.")
+                    else:
+                        rule_data['map_name'] = st.selectbox("Select Mapping Table", list(st.session_state.mapping_files.keys()))
+                        rule_data['in_col'] = st.selectbox("Input Column (Main)", cols)
+                        
+                        # Dynamically get columns from the selected mapping table
+                        target_m_df = st.session_state.mapping_files[rule_data['map_name']]
+                        m_cols = target_m_df.columns.tolist()
+                        
+                        rule_data['key_col'] = st.selectbox("Match Key (Mapping Table)", m_cols)
+                        rule_data['val_col'] = st.selectbox("Return Value (Mapping Table)", m_cols)
 
                 if st.button("Add Rule"):
                     if new_col_name:
                         st.session_state.rules.append(rule_data)
-                        st.rerun()
+                        st.success(f"Rule for {new_col_name} added.")
                     else:
                         st.error("Please enter a column name.")
 
@@ -137,13 +161,13 @@ def run_etl_app(email):
             for i, r in enumerate(st.session_state.rules):
                 rc1, rc2 = st.columns([5, 1])
                 rc1.info(f"**{r['name']}** ({r['type']})")
-                if rc2.button("🗑️", key=f"del_{i}"):
+                if rc2.button("🗑️", key=f"del_r_{i}"):
                     st.session_state.rules.pop(i)
                     st.rerun()
 
         with tab2:
             if st.button("▶️ RUN TRANSFORMATION", type="primary"):
-                st.session_state.result_df = apply_visual_rules(df, st.session_state.rules, mapping_files)
+                st.session_state.result_df = apply_visual_rules(df, st.session_state.rules, st.session_state.mapping_files)
             
             if 'result_df' in st.session_state:
                 st.dataframe(st.session_state.result_df, use_container_width=True)
