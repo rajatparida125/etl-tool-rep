@@ -1,0 +1,6 @@
+{
+  "output_columns": [
+    {"name": "CustomerName", "lookup": {"mapping_file": "customer_mapping", "input_col": "cust_id", "key_col": "id", "target_col": "name"}},
+    {"name": "Priority", "condition": {"if": [{"input_col": "amount", "operator": ">", "value": 1000}], "then": "VIP", "else": "Regular"}}
+  ]
+}
