@@ -23,7 +23,7 @@ authenticator = Authenticate(
     secret_credentials_path='google_credentials.json',
     cookie_name='kineti_auth_cookie',
     cookie_key='kinetibridge_secret_key', 
-    redirect_uri="https://etl-tool-rep-4p2dkdcahg8ltcnnrukfge.streamlit.app/" # Change to your live URL for deployment
+    redirect_uri="https://etl-tool-rep-4p2dkdcahg8ltcnnrukfge.streamlit.app/oauth2callback" # Change to your live URL for deployment
 )
 
 # Use the correct method name for the latest version
