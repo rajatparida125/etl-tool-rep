@@ -1,4 +1,6 @@
+# Ignore credentials and secrets
 .streamlit/
 google_credentials.json
 __pycache__/
+*.pyc
 .env

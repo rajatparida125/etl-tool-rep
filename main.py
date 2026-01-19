@@ -3,191 +3,145 @@ import pandas as pd
 import json
 import requests
 import os
-from sqlalchemy import create_engine
+import paramiko
+from io import BytesIO
 from streamlit_google_auth import Authenticate
 
-# --- 0. PRODUCTION CREDENTIALS RECONSTRUCTION ---
+# --- 0. AUTH & CREDENTIALS ---
 if "GOOGLE_CREDENTIALS_CONTENT" in st.secrets:
     if not os.path.exists("google_credentials.json"):
         with open("google_credentials.json", "w") as f:
             f.write(st.secrets["GOOGLE_CREDENTIALS_CONTENT"])
 
-# --- 1. CONFIGURATION ---
-st.set_page_config(page_title="KinetiBridge ETL Pro", layout="wide", page_icon="🌐")
+st.set_page_config(page_title="KinetiBridge Pro ETL", layout="wide", page_icon="🌐")
 
-PADDLE_API_KEY = st.secrets.get("PADDLE_API_KEY", "")
-
-# --- 2. AUTHENTICATION ---
 authenticator = Authenticate(
     secret_credentials_path='google_credentials.json',
     cookie_name='kineti_auth_cookie',
     cookie_key='kinetibridge_secret_key', 
     redirect_uri="https://etl-tool-rep-4p2dkdcahg8ltcnnrukfge.streamlit.app/oauth2callback"
 )
-
 authenticator.check_authentification()
 
-def is_subscribed(email):
-    return True 
-
-# --- 3. ETL ENGINE FUNCTIONS ---
-def load_data(file_obj, name):
-    ext = name.split('.')[-1].lower()
-    if ext == 'csv': return pd.read_csv(file_obj)
-    elif ext in ['xlsx', 'xls']: return pd.read_excel(file_obj)
+# --- 1. CORE ETL UTILITIES ---
+def smart_load(file_source, filename):
+    ext = filename.split('.')[-1].lower()
+    try:
+        if ext == 'csv': return pd.read_csv(file_source)
+        if ext in ['xlsx', 'xls']: return pd.read_excel(file_source)
+        if ext == 'json': return pd.read_json(file_source)
+    except Exception as e:
+        st.error(f"Error loading {filename}: {e}")
     return None
 
-def apply_visual_rules(df, rules, mapping_files):
+def apply_rules(df, rules, mappings):
     out_df = pd.DataFrame()
     for r in rules:
-        target_name = r['name']
-        mode = r['type']
-        
-        if mode == "Direct Map":
-            out_df[target_name] = df[r['source']]
-        
-        elif mode == "Conditional":
-            mask = pd.Series([True] * len(df))
-            col, op, val = r['cond_col'], r['cond_op'], r['cond_val']
-            try:
-                comp_val = float(val) if str(val).replace('.','',1).isdigit() else val
-                if op == ">": mask = df[col] > comp_val
-                elif op == "<": mask = df[col] < comp_val
-                elif op == "==": mask = df[col] == comp_val
-            except: pass
-            out_df[target_name] = mask.map({True: r['then'], False: r['else']})
-            
-        elif mode == "Lookup":
-            m_df = mapping_files.get(r['map_name'])
-            if m_df is not None:
-                # Use mapping file logic
-                lookup_dict = m_df.set_index(r['key_col'])[r['val_col']].to_dict()
-                out_df[target_name] = df[r['in_col']].map(lookup_dict)
-                
+        try:
+            name = r['name']
+            if r['type'] == "Direct Map":
+                out_df[name] = df[r['source']]
+            elif r['type'] == "Lookup":
+                m_df = mappings.get(r['map_name'])
+                if m_df is not None:
+                    lookup = m_df.set_index(r['key_col'])[r['val_col']].to_dict()
+                    out_df[name] = df[r['in_col']].map(lookup)
+            elif r['type'] == "Conditional":
+                # Basic conditional logic
+                c, op, v = r['cond_col'], r['cond_op'], r['cond_val']
+                if op == ">": mask = df[c] > float(v)
+                elif op == "<": mask = df[c] < float(v)
+                else: mask = df[c] == v
+                out_df[name] = mask.map({True: r['then'], False: r['else']})
+        except Exception as e:
+            st.warning(f"Skipping rule '{r.get('name')}': {e}")
     return out_df
 
-# --- 4. MAIN APP UI ---
-def run_etl_app(email):
-    st.title("🌐 KinetiBridge Visual ETL")
-    st.sidebar.info(f"User: {email}")
-
-    # Initialize session states
+# --- 2. MAIN APPLICATION UI ---
+def run_app(email):
+    st.title("🚀 KinetiBridge Pro ETL")
+    
+    # Persistent State
     if 'rules' not in st.session_state: st.session_state.rules = []
-    if 'mapping_files' not in st.session_state: st.session_state.mapping_files = {}
+    if 'input_dfs' not in st.session_state: st.session_state.input_dfs = {}
 
     with st.sidebar:
-        st.header("🔌 Source Data")
-        uploaded_file = st.file_uploader("Upload Main File", type=['csv', 'xlsx'])
+        st.header("📥 Data Sources")
+        uploaded_files = st.file_uploader("Extract Files (CSV, XLSX, JSON)", accept_multiple_files=True)
+        if uploaded_files:
+            for f in uploaded_files:
+                st.session_state.input_dfs[f.name] = smart_load(f, f.name)
         
         st.divider()
-        st.header("🗂️ Multi-Mapping Manager")
+        st.header("💾 Pipeline Management")
         
-        # UI for adding multiple mapping files
-        with st.expander("Add New Mapping Table"):
-            m_file = st.file_uploader("Upload Lookup File", type=['csv', 'xlsx'], key="m_uploader")
-            m_name = st.text_input("Mapping Name (Unique)", placeholder="e.g. region_codes")
-            if st.button("💾 Save Mapping"):
-                if m_file and m_name:
-                    if m_name in st.session_state.mapping_files:
-                        st.error("Name already exists!")
-                    else:
-                        st.session_state.mapping_files[m_name] = load_data(m_file, m_file.name)
-                        st.success(f"Added {m_name}")
-                else:
-                    st.error("Missing file or name")
-
-        # Display and manage current mappings
-        if st.session_state.mapping_files:
-            st.write("Current Mappings:")
-            for m in list(st.session_state.mapping_files.keys()):
-                col_m1, col_m2 = st.columns([3, 1])
-                col_m1.caption(f"📍 {m}")
-                if col_m2.button("🗑️", key=f"del_m_{m}"):
-                    del st.session_state.mapping_files[m]
-                    st.rerun()
+        # SAVE RULES
+        if st.session_state.rules:
+            pipeline_json = json.dumps(st.session_state.rules, indent=2)
+            st.download_button("📂 Export Pipeline (JSON)", pipeline_json, "pipeline.json", "application/json")
         
+        # LOAD RULES
+        loaded_pipeline = st.file_uploader("📥 Import Pipeline", type=['json'])
+        if loaded_pipeline:
+            st.session_state.rules = json.load(loaded_pipeline)
+            st.success("Pipeline loaded!")
+            
         st.divider()
         if st.button("Logout"):
             authenticator.logout()
             st.rerun()
 
-    if uploaded_file:
-        df = load_data(uploaded_file, uploaded_file.name)
+    if st.session_state.input_dfs:
+        main_source = st.selectbox("Select Primary File", list(st.session_state.input_dfs.keys()))
+        df = st.session_state.input_dfs[main_source]
         cols = df.columns.tolist()
 
-        tab1, tab2, tab3 = st.tabs(["🛠️ Rule Builder", "👁️ Preview Result", "🚀 Export"])
-
-        with tab1:
-            st.subheader("Define Transformation Rules")
-            with st.expander("➕ Add New Column Rule", expanded=True):
-                c1, c2, c3 = st.columns(3)
-                new_col_name = c1.text_input("New Column Name")
-                rule_type = c2.selectbox("Rule Type", ["Direct Map", "Conditional", "Lookup"])
+        t_build, t_preview, t_export = st.tabs(["🏗️ Builder", "🔭 Preview", "🚀 Load"])
+        
+        with t_build:
+            with st.expander("➕ Add Logic", expanded=True):
+                c1, c2 = st.columns(2)
+                r_name = c1.text_input("New Column Name")
+                r_type = c2.selectbox("Type", ["Direct Map", "Lookup", "Conditional"])
                 
-                rule_data = {"name": new_col_name, "type": rule_type}
+                rule = {"name": r_name, "type": r_type}
+                if r_type == "Direct Map":
+                    rule['source'] = st.selectbox("Source", cols)
+                elif r_type == "Lookup":
+                    rule['map_name'] = st.selectbox("Map Table", list(st.session_state.input_dfs.keys()))
+                    rule['in_col'] = st.selectbox("Input Key", cols)
+                    m_cols = st.session_state.input_dfs[rule['map_name']].columns.tolist()
+                    rule['key_col'] = st.selectbox("Map Key", m_cols)
+                    rule['val_col'] = st.selectbox("Map Value", m_cols)
                 
-                if rule_type == "Direct Map":
-                    rule_data['source'] = st.selectbox("Source Column", cols)
-                elif rule_type == "Conditional":
-                    r1, r2, r3 = st.columns(3)
-                    rule_data['cond_col'] = r1.selectbox("If Column", cols)
-                    rule_data['cond_op'] = r2.selectbox("Operator", [">", "<", "=="])
-                    rule_data['cond_val'] = r3.text_input("Value")
-                    r4, r5 = st.columns(2)
-                    rule_data['then'] = r4.text_input("Then Result")
-                    rule_data['else'] = r5.text_input("Else Result")
-                elif rule_type == "Lookup":
-                    if not st.session_state.mapping_files:
-                        st.warning("⚠️ Please add a mapping table in the sidebar first.")
-                    else:
-                        rule_data['map_name'] = st.selectbox("Select Mapping Table", list(st.session_state.mapping_files.keys()))
-                        rule_data['in_col'] = st.selectbox("Input Column (Main)", cols)
-                        
-                        # Dynamically get columns from the selected mapping table
-                        target_m_df = st.session_state.mapping_files[rule_data['map_name']]
-                        m_cols = target_m_df.columns.tolist()
-                        
-                        rule_data['key_col'] = st.selectbox("Match Key (Mapping Table)", m_cols)
-                        rule_data['val_col'] = st.selectbox("Return Value (Mapping Table)", m_cols)
-
                 if st.button("Add Rule"):
-                    if new_col_name:
-                        st.session_state.rules.append(rule_data)
-                        st.success(f"Rule for {new_col_name} added.")
-                    else:
-                        st.error("Please enter a column name.")
+                    st.session_state.rules.append(rule)
+                    st.rerun()
 
-            st.write("### Active Rules")
+            st.write("Current Rules:")
             for i, r in enumerate(st.session_state.rules):
-                rc1, rc2 = st.columns([5, 1])
-                rc1.info(f"**{r['name']}** ({r['type']})")
-                if rc2.button("🗑️", key=f"del_r_{i}"):
+                rc1, rc2 = st.columns([5,1])
+                rc1.info(f"{r['name']} ({r['type']})")
+                if rc2.button("🗑️", key=f"del_{i}"):
                     st.session_state.rules.pop(i)
                     st.rerun()
 
-        with tab2:
-            if st.button("▶️ RUN TRANSFORMATION", type="primary"):
-                st.session_state.result_df = apply_visual_rules(df, st.session_state.rules, st.session_state.mapping_files)
-            
+        with t_preview:
+            if st.button("▶️ EXECUTE PIPELINE"):
+                st.session_state.result_df = apply_rules(df, st.session_state.rules, st.session_state.input_dfs)
             if 'result_df' in st.session_state:
-                st.dataframe(st.session_state.result_df, use_container_width=True)
+                st.dataframe(st.session_state.result_df)
 
-        with tab3:
+        with t_export:
             if 'result_df' in st.session_state:
                 csv = st.session_state.result_df.to_csv(index=False).encode('utf-8')
-                st.download_button("💾 Download Result CSV", csv, "kinetibridge_output.csv")
+                st.download_button("💾 Download Results", csv, "output.csv")
     else:
-        st.info("Please upload a file in the sidebar to begin.")
+        st.info("Upload your source files to begin.")
 
-# --- 5. GATEKEEPER ---
+# --- 3. GATEKEEPER ---
 if st.session_state.get('connected'):
-    email = st.session_state['user_info'].get('email')
-    if is_subscribed(email):
-        run_etl_app(email)
-    else:
-        st.title("💳 Subscription Required")
-        st.warning("Please subscribe to use KinetiBridge ETL.")
-        st.markdown("[Upgrade to Pro](https://your-paddle-link.com)")
+    run_app(st.session_state['user_info'].get('email'))
 else:
-    st.title("Welcome to KinetiBridge ETL")
+    st.title("Welcome to KinetiBridge")
     authenticator.login()
