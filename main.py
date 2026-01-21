@@ -3,6 +3,7 @@ import pandas as pd
 import json
 import os
 import paramiko
+import requests # Required for Lemon Squeezy
 from io import BytesIO, StringIO
 from streamlit_google_auth import Authenticate
 
@@ -15,10 +16,7 @@ if "GOOGLE_CREDENTIALS_CONTENT" in st.secrets:
 st.set_page_config(page_title="KinetiBridge Universal ETL", layout="wide", page_icon="🌉")
 
 # --- AUTH SETUP ---
-# For Cloud Deployment, we hardcode the production URL to prevent detection errors.
-# If you want to run locally later, just swap the comment # to the other line.
-
-# redirect_uri = "http://localhost:8501/oauth2callback"  # <--- UNCOMMENT FOR LOCAL TESTING
+#redirect_uri = "http://localhost:8501/oauth2callback"  # <--- UNCOMMENT FOR LOCAL TESTING
 redirect_uri = "https://etl-tool-rep-4p2dkdcahg8ltcnnrukfge.streamlit.app/oauth2callback" # <--- ACTIVE FOR CLOUD
 
 authenticator = Authenticate(
@@ -29,7 +27,45 @@ authenticator = Authenticate(
 )
 authenticator.check_authentification()
 
-# --- 1. SMART DATA HANDLER ---
+# --- 1. LEMON SQUEEZY SUBSCRIPTION CHECKER ---
+def check_lemon_status(email):
+    """
+    Checks if the user has an active subscription or a valid trial (10 days).
+    """
+    # Get secrets from Streamlit
+    api_key = st.secrets.get("LEMON_API_KEY")
+    store_id = st.secrets.get("LEMON_STORE_ID")
+    
+    # If no keys are set yet, we allow access (Safe for testing before you add secrets)
+    if not api_key:
+        return True 
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Accept": "application/vnd.api+json"
+    }
+    
+    try:
+        # Search for subscriptions specifically for this email and store
+        url = f"https://api.lemonsqueezy.com/v1/subscriptions?filter[user_email]={email}&filter[store_id]={store_id}"
+        response = requests.get(url, headers=headers)
+        data = response.json()
+        
+        # Check the response data
+        if data.get('data'):
+            for sub in data['data']:
+                status = sub['attributes']['status']
+                # Lemon Squeezy logic: If status is 'active' (paid) or 'on_trial' (free 10 days), let them in.
+                if status in ['active', 'on_trial']:
+                    return True
+    except Exception as e:
+        # If API fails (e.g. connection issue), block access for security or print error
+        print(f"License Error: {e}")
+        pass
+        
+    return False
+
+# --- 2. SMART DATA HANDLER (Original Full Version) ---
 def smart_load(file_obj, filename, file_type_override=None):
     """
     Robust loader for CSV, Pipe, Excel, JSON, Parquet.
@@ -57,7 +93,7 @@ def smart_load(file_obj, filename, file_type_override=None):
         st.error(f"Error loading {filename}: {str(e)}")
         return None
 
-# --- 2. SERVER CONNECTIVITY (SFTP) ---
+# --- 3. SERVER CONNECTIVITY (Original Full Version) ---
 def sftp_action(host, port, user, password, action, remote_path, local_data=None):
     """
     Handles both Extract (Get) and Load (Put) via SFTP
@@ -90,7 +126,7 @@ def sftp_action(host, port, user, password, action, remote_path, local_data=None
         st.caption("Tip: Ensure your server firewall allows connections from this IP.")
         return None
 
-# --- 3. TRANSFORMATION ENGINE ---
+# --- 4. TRANSFORMATION ENGINE (Original Full Version) ---
 def apply_rules_engine(main_df, rules, mapping_dfs):
     """
     Applies transformation logic.
@@ -139,7 +175,7 @@ def apply_rules_engine(main_df, rules, mapping_dfs):
             
     return out_df
 
-# --- 4. LEGAL & TERMS FOOTER ---
+# --- 5. LEGAL FOOTER ---
 def show_legal_footer():
     st.markdown("---")
     with st.expander("📜 Legal Notices, Terms of Service & Privacy Policy", expanded=False):
@@ -147,25 +183,57 @@ def show_legal_footer():
         ### 1. Terms of Service
         By using **KinetiBridge Universal ETL** ("the Service"), you agree to the following terms:
         * **"As Is" Basis:** The Service is provided "as is" without warranty of any kind, express or implied.
-        * **No Liability:** The developers of KinetiBridge shall not be liable for any damages, data loss, or server issues arising from the use of this tool.
+        * **No Liability:** The developers of KinetiBridge shall not be liable for any damages, data loss, or server issues.
         * **User Responsibility:** You are solely responsible for the data you upload and the server credentials you provide.
         
         ### 2. Privacy Policy & Data Handling
         * **Data Persistence:** We **do not** permanently store your uploaded files. All data is processed in temporary memory (RAM) and is discarded when your session ends or you reload the page.
-        * **Server Credentials:** SFTP hostnames, usernames, and passwords entered in this application are **not saved** to any database. They are used strictly for the duration of the active session to establish connections you request.
-        * **Google Auth:** We use Google OAuth solely for authentication. We do not access your emails or Drive files unless explicitly granted.
-
+        * **Server Credentials:** SFTP hostnames, usernames, and passwords entered in this application are **not saved** to any database.
+        
         ### 3. Server Connectivity Disclaimer
-        * **Firewalls:** This application runs on a dynamic cloud environment. To connect to your private SFTP servers, you may need to whitelist the dynamic IP of this instance or allow public access.
-        * **Security:** Ensure you use strong passwords. We recommend using temporary credentials when connecting via third-party tools.
+        * **Firewalls:** This application runs on a dynamic cloud environment. To connect to your private SFTP servers, you may need to whitelist the dynamic IP of this instance.
         
         *Last Updated: 2026*
         """)
 
-# --- 5. UI & STATE MANAGEMENT ---
+# --- 6. UI & STATE MANAGEMENT ---
 def run_app(email):
+    # ============================================================
+    # 🔒 LIVE LEMON SQUEEZY GATE (10 DAY TRIAL)
+    # ============================================================
+    if not check_lemon_status(email):
+        st.title("🔒 Start Your 10-Day Free Trial")
+        st.info(f"Welcome, {email}. To access KinetiBridge Pro, please start your free trial.")
+        
+        # Get checkout link from secrets
+        checkout_link = st.secrets.get("LEMON_CHECKOUT_URL", "#")
+        
+        # Auto-fill email in checkout link for better UX
+        if "?" in checkout_link:
+            checkout_link += f"&checkout[email]={email}"
+        else:
+            checkout_link += f"?checkout[email]={email}"
+        
+        st.markdown(f"""
+        <a href="{checkout_link}" target="_blank" style="text-decoration:none;">
+            <div style="background-color:#7047EB;color:white;padding:15px;text-align:center;border-radius:5px;font-weight:bold;font-size:18px;">
+                🚀 Activate 10-Day Free Trial
+            </div>
+        </a>
+        """, unsafe_allow_html=True)
+        
+        st.write("")
+        st.caption("You will not be charged until the trial period ends. Cancel anytime.")
+        
+        if st.button("I have activated my trial, Refresh"):
+            st.rerun()
+            
+        show_legal_footer()
+        return  # <--- STOP HERE if not subscribed
+    # ============================================================
+
     st.title("🚀 KinetiBridge Pro ETL")
-    st.caption(f"Logged in as: {email}")
+    st.caption(f"Logged in as: {email} | Status: Active ✅")
     
     # Session State
     if 'rules' not in st.session_state: st.session_state.rules = []
@@ -177,7 +245,6 @@ def run_app(email):
     with st.sidebar:
         st.header("1. Data Extraction")
         
-        # --- MAIN DATA SOURCE ---
         extract_mode = st.radio("Main Source Type", ["Upload Files", "Connect to Server (SFTP)"])
         
         if extract_mode == "Upload Files":
@@ -210,7 +277,6 @@ def run_app(email):
         st.divider()
         st.header("2. Mapping Tables")
         
-        # --- MAPPING SOURCE (Extract from Server Added) ---
         map_source = st.radio("Mapping Source", ["Upload Lookups", "Download from Server (SFTP)"])
         
         if map_source == "Upload Lookups":
@@ -249,7 +315,6 @@ def run_app(email):
     # --- MAIN WORKSPACE ---
     if st.session_state.data_inventory:
         
-        # Select Primary Dataset
         file_options = list(st.session_state.data_inventory.keys())
         selected_file = st.selectbox("Select Primary Data for Pipeline", file_options)
         main_df = st.session_state.data_inventory[selected_file]
@@ -257,7 +322,6 @@ def run_app(email):
         
         st.divider()
         
-        # RULES IMPORT / EXPORT
         col_imp, col_exp = st.columns([1, 1])
         with col_imp:
             uploaded_rules = st.file_uploader("📥 Import Pipeline (JSON)", type=['json'], label_visibility="collapsed")
@@ -274,10 +338,8 @@ def run_app(email):
                 rules_json = json.dumps(st.session_state.rules, indent=2)
                 st.download_button("💾 Export Pipeline (JSON)", rules_json, "pipeline.json", "application/json", use_container_width=True)
 
-        # TABS
         tab_build, tab_run, tab_load = st.tabs(["🏗️ Builder", "👁️ Preview", "🚀 Load / Export"])
         
-        # --- TAB 1: BUILDER ---
         with tab_build:
             with st.expander("➕ Add Logic", expanded=True):
                 c1, c2 = st.columns([1, 1])
@@ -361,7 +423,6 @@ def run_app(email):
                         st.session_state.rules.pop(i)
                         st.rerun()
 
-        # --- TAB 2: PREVIEW ---
         with tab_run:
             if st.button("▶️ RUN PIPELINE", type="primary"):
                 st.session_state.result_df = apply_rules_engine(
@@ -371,7 +432,6 @@ def run_app(email):
             if 'result_df' in st.session_state:
                 st.dataframe(st.session_state.result_df.head(100), use_container_width=True)
 
-        # --- TAB 3: LOAD / EXPORT ---
         with tab_load:
             st.header("Data Loading")
             load_mode = st.radio("Destination", ["Download File", "Push to Server (SFTP)"])
@@ -401,7 +461,6 @@ def run_app(email):
     else:
         st.info("👈 Please Extract Data using the Sidebar to begin.")
 
-    # --- SHOW LEGAL FOOTER ---
     show_legal_footer()
 
 # --- GATEKEEPER ---
@@ -409,5 +468,5 @@ if st.session_state.get('connected'):
     run_app(st.session_state['user_info'].get('email'))
 else:
     st.title("Login to KinetiBridge")
-    show_legal_footer() # Ensure legal footer is visible even on login screen
+    show_legal_footer()
     authenticator.login()
